@@ -112,10 +112,14 @@ rồi mới port sang `pow/pow.go` + giữ lại test trong `pow/pow_test.go`.
 
 - `main.go` — routes OpenAI-compatible, không chứa logic DeepSeek.
 - `ds/client.go` — auth/session/headers/retry/re-login; `ds/completion.go` —
-  SSE parser + parent tracking.
+  SSE parser + parent tracking; `ds/dsml.go` — DSML → tool_calls adapter.
 - `pow/pow.go` (+ test vector thực) — DeepSeekHashV1.
 - `scripts/login.js` — browser login duy nhất.
 - Không commit: `account.json`, `state/`, binary (đã có trong `.gitignore`).
+
+**Go là implementation duy nhất.** Bản Node cũ (`src/`, `wasm_pow.wasm`,
+`express`/`cors`) đã bị xoá — `package.json` chỉ còn `playwright-core` cho
+`scripts/login.js`. Mọi thay đổi hành vi gateway phải làm ở `main.go`/`ds/`.
 
 ## 6. Chạy gateway
 

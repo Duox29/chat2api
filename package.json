@@ -1,18 +1,13 @@
 {
   "name": "chat2api",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "start": "node src/server.js"
-  },
+  "description": "Headless-browser login helper for the chat2api Go gateway (DeepSeek web chat -> OpenAI-compatible API).",
+  "private": true,
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "cors": "^2.8.6",
-    "express": "^5.2.1",
     "playwright-core": "^1.63.0"
   }
 }

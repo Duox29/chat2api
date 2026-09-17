@@ -6,7 +6,7 @@ Viết bằng Go (stdlib, không dependency ngoài), login qua Chromium headless
 ## 1. Yêu cầu
 
 - Go ≥ 1.22
-- Node.js + `playwright-core` (đã có trong `node_modules/`)
+- Node.js + `playwright-core` (chỉ cho `scripts/login.js`; gateway chạy bằng Go, không cần `node_modules/` khi đã có `state/session.json`)
 - Chromium của Playwright: `~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome`
 - Tài khoản DeepSeek ghi trong `account.json`:
   ```json
