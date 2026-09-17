@@ -121,8 +121,7 @@ func TestStreamFilterRawAccessor(t *testing.T) {
 	logDSMLRaw("test", raw, ds.ParseDSML(raw))
 }
 
-func TestDsmlEnabledToggle(t *testing.T) {
-	old, had := os.LookupEnv("DSML_ENABLED")
+func TestDsmlEnabledToggle(t *testing.T) {	old, had := os.LookupEnv("DSML_ENABLED")
 	defer func() {
 		if had {
 			os.Setenv("DSML_ENABLED", old)
@@ -176,5 +175,60 @@ func TestDsmlEnabledToggle(t *testing.T) {
 		if c, tcs, f := adaptDSML("Hello"); c != "Hello" || tcs != nil || f != "stop" {
 			t.Fatalf("plain text altered (mode %q): %q %v %q", v, c, tcs, f)
 		}
+	}
+}
+
+func TestAffinityPrefixMatch(t *testing.T) {
+	mk := func(role, content string) map[string]interface{} {
+		return map[string]interface{}{"role": role, "content": content}
+	}
+	turn1 := []map[string]interface{}{mk("user", "hi")}
+	turn2 := []map[string]interface{}{
+		mk("user", "hi"),
+		mk("assistant", "hello"),
+		mk("user", "how are you?"),
+	}
+	n1 := normalizeAffinityMessages(turn1)
+	n2 := normalizeAffinityMessages(turn2)
+	if !affinityPrefixMatch(n1, n2) {
+		t.Fatal("turn2 should extend turn1")
+	}
+	if affinityPrefixMatch(n2, n1) {
+		t.Fatal("shorter history must not match longer stored prefix")
+	}
+	fresh := normalizeAffinityMessages([]map[string]interface{}{mk("user", "new topic")})
+	if affinityPrefixMatch(n1, fresh) {
+		t.Fatal("/new history must not match previous session")
+	}
+	if !isAutoSessionID("") || !isAutoSessionID("new") || !isAutoSessionID("auto") {
+		t.Fatal("empty/new/auto must be auto session ids")
+	}
+	if isAutoSessionID("abc123") {
+		t.Fatal("explicit id must not be auto")
+	}
+}
+
+func TestAffinityFindAndUpsert(t *testing.T) {
+	affinityMu.Lock()
+	affinityEntries = nil
+	affinityMu.Unlock()
+	mk := func(role, content string) map[string]interface{} {
+		return map[string]interface{}{"role": role, "content": content}
+	}
+	turn1 := []map[string]interface{}{mk("user", "hi")}
+	turn2 := []map[string]interface{}{
+		mk("user", "hi"),
+		mk("assistant", "hello"),
+		mk("user", "next?"),
+	}
+	upsertAffinity("sess-1", turn1, "User: hi")
+	got := findAffinity(normalizeAffinityMessages(turn2))
+	if got == nil || got.SessionID != "sess-1" {
+		t.Fatalf("expected reuse of sess-1, got %+v", got)
+	}
+	// Divergent history -> no match -> caller would create a new session.
+	fresh := []map[string]interface{}{mk("user", "something else")}
+	if got := findAffinity(normalizeAffinityMessages(fresh)); got != nil {
+		t.Fatalf("fresh history must not reuse, got %+v", got)
 	}
 }

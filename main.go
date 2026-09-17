@@ -11,6 +11,8 @@
 //
 //	Env:
 //	  PORT=8080  GATEWAY_API_KEY=<optional>  CHROME_PATH=<optional>
+//	  SESSION_AFFINITY=1 (default on: same local thread reuses one web session,
+//	    /new resets history -> new web session; 0 to disable, always new)
 package main
 
 import (
@@ -21,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"chat2api/ds"
@@ -49,6 +52,214 @@ func resolveModel(name string) Model {
 		}
 	}
 	return models[0]
+}
+
+// ---- session affinity ----
+// Maps a stateless OpenAI-style conversation (full messages[] each request)
+// onto a stateful DeepSeek web session:
+//   - same local thread (new messages[] extends previous messages[]) reuses
+//     the same web chat_session_id and sends only the incremental tail;
+//   - /new (history reset / divergent) no longer matches any prefix, so a
+//     fresh web session is created automatically.
+// Explicit session_id from the client always wins; "new"/"auto" forces a
+// fresh web session. Disable with SESSION_AFFINITY=0|false|no|off.
+const affinityMaxEntries = 32
+
+type affinityMsg struct {
+	Role       string
+	Content    string
+	Name       string
+	ToolCallID string
+	ToolCalls  string
+}
+
+type affinityEntry struct {
+	SessionID string
+	Messages  []affinityMsg
+	Prompt    string // last full legacy prompt (for /v1/completions)
+	Updated   time.Time
+}
+
+var (
+	affinityMu      sync.Mutex
+	affinityEntries []affinityEntry
+)
+
+func sessionAffinityEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SESSION_AFFINITY"))) {
+	case "", "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAutoSessionID(id string) bool {
+	switch strings.ToLower(strings.TrimSpace(id)) {
+	case "", "new", "_new", "auto":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeAffinityMessages(msgs []map[string]interface{}) []affinityMsg {
+	out := make([]affinityMsg, 0, len(msgs))
+	for _, m := range msgs {
+		role, _ := m["role"].(string)
+		name, _ := m["name"].(string)
+		callID, _ := m["tool_call_id"].(string)
+		if callID == "" {
+			callID, _ = m["id"].(string)
+		}
+		tcSig := ""
+		if raw, ok := m["tool_calls"].([]interface{}); ok {
+			var parts []string
+			for _, tc := range raw {
+				tm, _ := tc.(map[string]interface{})
+				if tm == nil {
+					continue
+				}
+				id, _ := tm["id"].(string)
+				fn, _ := tm["function"].(map[string]interface{})
+				fname, args := "", ""
+				if fn != nil {
+					fname, _ = fn["name"].(string)
+					args, _ = fn["arguments"].(string)
+					if args == "" {
+						if av, ok := fn["arguments"]; ok && av != nil {
+							args = fmt.Sprint(av)
+						}
+					}
+				} else {
+					fname, _ = tm["name"].(string)
+				}
+				parts = append(parts, id+"|"+fname+"|"+args)
+			}
+			tcSig = strings.Join(parts, ";")
+		}
+		out = append(out, affinityMsg{
+			Role: role, Content: messageContentToString(m["content"]),
+			Name: name, ToolCallID: callID, ToolCalls: tcSig,
+		})
+	}
+	return out
+}
+
+func affinityPrefixMatch(old, cur []affinityMsg) bool {
+	if len(old) == 0 || len(old) > len(cur) {
+		return false
+	}
+	for i := range old {
+		if old[i] != cur[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// findAffinity returns the session whose stored messages are a prefix of cur.
+// Best match = longest prefix, tie-break most recently updated. Caller must
+// not hold affinityMu.
+func findAffinity(cur []affinityMsg) *affinityEntry {
+	affinityMu.Lock()
+	defer affinityMu.Unlock()
+	var best *affinityEntry
+	for i := range affinityEntries {
+		e := &affinityEntries[i]
+		if len(e.Messages) == 0 {
+			continue
+		}
+		if !affinityPrefixMatch(e.Messages, cur) {
+			continue
+		}
+		if best == nil || len(e.Messages) > len(best.Messages) ||
+			(len(e.Messages) == len(best.Messages) && e.Updated.After(best.Updated)) {
+			best = e
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	cp := *best
+	return &cp
+}
+
+func findAffinityByPrompt(prompt string) *affinityEntry {
+	if strings.TrimSpace(prompt) == "" {
+		return nil
+	}
+	affinityMu.Lock()
+	defer affinityMu.Unlock()
+	var best *affinityEntry
+	for i := range affinityEntries {
+		e := &affinityEntries[i]
+		if e.Prompt == "" || len(e.Messages) > 0 {
+			continue
+		}
+		if !strings.HasPrefix(prompt, e.Prompt) {
+			continue
+		}
+		if best == nil || len(e.Prompt) > len(best.Prompt) {
+			best = e
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	cp := *best
+	return &cp
+}
+
+func upsertAffinity(sessionID string, msgs []map[string]interface{}, prompt string) {
+	if sessionID == "" {
+		return
+	}
+	norm := normalizeAffinityMessages(msgs)
+	affinityMu.Lock()
+	defer affinityMu.Unlock()
+	for i := range affinityEntries {
+		if affinityEntries[i].SessionID == sessionID {
+			affinityEntries[i].Messages = norm
+			affinityEntries[i].Prompt = prompt
+			affinityEntries[i].Updated = time.Now()
+			return
+		}
+	}
+	affinityEntries = append(affinityEntries, affinityEntry{
+		SessionID: sessionID, Messages: norm, Prompt: prompt, Updated: time.Now(),
+	})
+	if len(affinityEntries) > affinityMaxEntries {
+		// Evict oldest.
+		oldest := 0
+		for i := range affinityEntries {
+			if affinityEntries[i].Updated.Before(affinityEntries[oldest].Updated) {
+				oldest = i
+			}
+		}
+		affinityEntries = append(affinityEntries[:oldest], affinityEntries[oldest+1:]...)
+	}
+}
+
+func upsertAffinityPrompt(sessionID, prompt string) {
+	if sessionID == "" {
+		return
+	}
+	affinityMu.Lock()
+	defer affinityMu.Unlock()
+	for i := range affinityEntries {
+		if affinityEntries[i].SessionID == sessionID {
+			affinityEntries[i].Prompt = prompt
+			affinityEntries[i].Updated = time.Now()
+			return
+		}
+	}
+	affinityEntries = append(affinityEntries, affinityEntry{
+		SessionID: sessionID, Prompt: prompt, Updated: time.Now(),
+	})
+	if len(affinityEntries) > affinityMaxEntries {
+		affinityEntries = affinityEntries[len(affinityEntries)-affinityMaxEntries:]
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -393,8 +604,8 @@ func main() {
 			return
 		}
 		model := resolveModel(req.Model)
-		prompt := appendToolsSection(messagesToPrompt(req.Messages), req.Tools)
-		if strings.TrimSpace(prompt) == "" {
+		fullPrompt := appendToolsSection(messagesToPrompt(req.Messages), req.Tools)
+		if strings.TrimSpace(fullPrompt) == "" {
 			errJSON(w, 400, "messages is required")
 			return
 		}
@@ -411,14 +622,48 @@ func main() {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
 
+		prompt := fullPrompt
 		sessionID := req.SessionID
-		if sessionID == "" {
+		reused := false
+		switch {
+		case !isAutoSessionID(sessionID):
+			// Explicit session_id: honor as-is (documented multi-turn usage).
+		case !sessionAffinityEnabled():
 			s, err := client.CreateSession(ctx)
 			if err != nil {
 				errJSON(w, 502, err.Error())
 				return
 			}
 			sessionID = s.ID
+		default:
+			cur := normalizeAffinityMessages(req.Messages)
+			if match := findAffinity(cur); match != nil && len(cur) >= len(match.Messages) {
+				sessionID = match.SessionID
+				reused = true
+				tail := req.Messages[len(match.Messages):]
+				if len(tail) == 0 && len(req.Messages) > 0 {
+					// Identical retry: resend the last turn.
+					tail = req.Messages[len(req.Messages)-1:]
+				}
+				if len(tail) > 0 {
+					prompt = appendToolsSection(messagesToPrompt(tail), req.Tools)
+					if strings.TrimSpace(prompt) == "" {
+						prompt = fullPrompt
+					}
+				}
+			} else {
+				s, err := client.CreateSession(ctx)
+				if err != nil {
+					errJSON(w, 502, err.Error())
+					return
+				}
+				sessionID = s.ID
+			}
+		}
+		if reused {
+			log.Printf("affinity: reuse web session %s (msgs %d, tail prompt len %d)", shortID(sessionID), len(req.Messages), len(prompt))
+		} else if isAutoSessionID(req.SessionID) && sessionAffinityEnabled() {
+			log.Printf("affinity: new web session %s (msgs %d)", shortID(sessionID), len(req.Messages))
 		}
 		opt := ds.CompletionOptions{
 			SessionID: sessionID, Prompt: prompt, ModelType: model.ModelType,
@@ -439,7 +684,7 @@ func main() {
 			fl, _ := w.(http.Flusher)
 			base := map[string]interface{}{
 				"id": chatID, "object": "chat.completion.chunk",
-				"created": created, "model": model.ID,
+				"created": created, "model": model.ID, "session_id": sessionID,
 			}
 			chunk := func(delta map[string]interface{}, finish string) {
 				c := map[string]interface{}{}
@@ -524,6 +769,7 @@ func main() {
 				chunk(map[string]interface{}{}, "stop")
 			}
 			fmt.Fprintf(w, "data: [DONE]\n\n")
+			upsertAffinity(sessionID, req.Messages, fullPrompt)
 			return
 		}
 
@@ -547,6 +793,7 @@ func main() {
 		if len(toolCalls) > 0 {
 			msg["tool_calls"] = toolCalls
 		}
+		upsertAffinity(sessionID, req.Messages, fullPrompt)
 		writeJSON(w, 200, map[string]interface{}{
 			"id": chatID, "object": "chat.completion", "created": created, "model": model.ID,
 			"session_id": sessionID,
@@ -569,23 +816,42 @@ func main() {
 			return
 		}
 		model := resolveModel(req.Model)
-		var prompt string
+		var fullPrompt string
 		switch t := req.Prompt.(type) {
 		case string:
-			prompt = t
+			fullPrompt = t
 		default:
-			prompt = fmt.Sprint(req.Prompt)
+			fullPrompt = fmt.Sprint(req.Prompt)
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
+		prompt := fullPrompt
 		sessionID := req.SessionID
-		if sessionID == "" {
+		switch {
+		case !isAutoSessionID(sessionID):
+			// Explicit session_id wins.
+		case !sessionAffinityEnabled():
 			s, err := client.CreateSession(ctx)
 			if err != nil {
 				errJSON(w, 502, err.Error())
 				return
 			}
 			sessionID = s.ID
+		default:
+			if match := findAffinityByPrompt(fullPrompt); match != nil {
+				sessionID = match.SessionID
+				if tail := strings.TrimPrefix(fullPrompt, match.Prompt); strings.TrimSpace(tail) != "" {
+					prompt = tail
+				}
+				log.Printf("affinity: reuse web session %s (legacy completions)", shortID(sessionID))
+			} else {
+				s, err := client.CreateSession(ctx)
+				if err != nil {
+					errJSON(w, 502, err.Error())
+					return
+				}
+				sessionID = s.ID
+			}
 		}
 		opt := ds.CompletionOptions{SessionID: sessionID, Prompt: prompt, ModelType: model.ModelType}
 		created := time.Now().Unix()
@@ -623,6 +889,7 @@ func main() {
 				send("", "stop")
 			}
 			fmt.Fprintf(w, "data: [DONE]\n\n")
+			upsertAffinityPrompt(sessionID, fullPrompt)
 			return
 		}
 		text, _, _, err := client.Complete(ctx, opt)
@@ -630,6 +897,7 @@ func main() {
 			errJSON(w, 502, err.Error())
 			return
 		}
+		upsertAffinityPrompt(sessionID, fullPrompt)
 		writeJSON(w, 200, map[string]interface{}{
 			"id": "cmpl-" + shortID(sessionID), "object": "text_completion",
 			"created": created, "model": model.ID, "session_id": sessionID,

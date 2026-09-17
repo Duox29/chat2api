@@ -100,6 +100,75 @@ function dsmlToOpenAIToolCalls(calls) {
   }));
 }
 
+// ---- session affinity ----
+// Same idea as the Go gateway: OpenAI clients resend the full messages[]
+// each turn. If the new messages[] extends a previously seen conversation
+// (prefix match), reuse the same DeepSeek web session and send only the
+// incremental tail. A /new (reset/divergent history) matches nothing, so a
+// fresh web session is created. Explicit session_id always wins;
+// "new"/"auto" forces a fresh session. Disable with SESSION_AFFINITY=0.
+const AFFINITY_MAX = 32;
+const affinityEntries = []; // { sessionId, messages, prompt, updated }
+function sessionAffinityEnabled() {
+  return ['', '1', 'true', 'yes', 'on'].includes(String(process.env.SESSION_AFFINITY ?? '').toLowerCase().trim());
+}
+function isAutoSessionId(id) {
+  return ['', 'new', '_new', 'auto'].includes(String(id ?? '').toLowerCase().trim());
+}
+function normAffinityMessages(msgs) {
+  return (msgs || []).map(m => ({
+    role: m.role || '',
+    content: contentToString(m.content),
+    name: m.name || '',
+    toolCallId: m.tool_call_id || m.id || '',
+    toolCalls: Array.isArray(m.tool_calls) ? m.tool_calls.map(tc => {
+      const fn = tc.function || {};
+      return `${tc.id || ''}|${fn.name || tc.name || ''}|${fn.arguments || ''}`;
+    }).join(';') : '',
+  }));
+}
+function affinityPrefix(oldA, curA) {
+  if (!oldA.length || oldA.length > curA.length) return false;
+  for (let i = 0; i < oldA.length; i++) {
+    const a = oldA[i], b = curA[i];
+    if (a.role !== b.role || a.content !== b.content || a.name !== b.name ||
+        a.toolCallId !== b.toolCallId || a.toolCalls !== b.toolCalls) return false;
+  }
+  return true;
+}
+function findAffinity(cur) {
+  let best = null;
+  for (const e of affinityEntries) {
+    if (!e.messages || !e.messages.length) continue;
+    if (!affinityPrefix(e.messages, cur)) continue;
+    if (!best || e.messages.length > best.messages.length ||
+        (e.messages.length === best.messages.length && e.updated > best.updated)) best = e;
+  }
+  return best;
+}
+function findAffinityByPrompt(prompt) {
+  if (!prompt) return null;
+  let best = null;
+  for (const e of affinityEntries) {
+    if (!e.prompt || (e.messages && e.messages.length)) continue;
+    if (!prompt.startsWith(e.prompt)) continue;
+    if (!best || e.prompt.length > best.prompt.length) best = e;
+  }
+  return best;
+}
+function upsertAffinity(sessionId, msgs, prompt) {
+  if (!sessionId) return;
+  const norm = normAffinityMessages(msgs);
+  const now = Date.now();
+  const ex = affinityEntries.find(e => e.sessionId === sessionId);
+  if (ex) { ex.messages = norm; ex.prompt = prompt; ex.updated = now; return; }
+  affinityEntries.push({ sessionId, messages: norm, prompt, updated: now });
+  if (affinityEntries.length > AFFINITY_MAX) {
+    affinityEntries.sort((a, b) => a.updated - b.updated);
+    affinityEntries.splice(0, affinityEntries.length - AFFINITY_MAX);
+  }
+}
+
 // DSML parser toggle. Default ON; set DSML_ENABLED=0|false|no|off to pass
 // DeepSeek response text through verbatim (no tool_calls ever emitted).
 function dsmlParsingEnabled() {
@@ -185,11 +254,33 @@ async function main() {
     try {
       const { model: modelName, messages, tools, stream, session_id, thinking_enabled, search_enabled } = req.body || {};
       const model = resolveModel(modelName);
-      const prompt = appendToolsSection(messagesToPrompt(messages), tools);
-      if (!prompt) return res.status(400).json({ error: { message: 'messages is required' } });
+      const fullPrompt = appendToolsSection(messagesToPrompt(messages), tools);
+      if (!fullPrompt) return res.status(400).json({ error: { message: 'messages is required' } });
 
       const thinking = thinking_enabled ?? model.thinking;
-      const sessionId = session_id || (await ds.createSession()).id;
+      let prompt = fullPrompt;
+      let sessionId = session_id;
+      let reused = false;
+      if (!isAutoSessionId(sessionId)) {
+        // Explicit session_id wins.
+      } else if (!sessionAffinityEnabled()) {
+        sessionId = (await ds.createSession()).id;
+      } else {
+        const cur = normAffinityMessages(messages);
+        const match = findAffinity(cur);
+        if (match && cur.length >= match.messages.length) {
+          sessionId = match.sessionId;
+          reused = true;
+          let tail = messages.slice(match.messages.length);
+          if (!tail.length && messages.length) tail = messages.slice(-1);
+          if (tail.length) {
+            prompt = appendToolsSection(messagesToPrompt(tail), tools) || fullPrompt;
+          }
+        } else {
+          sessionId = (await ds.createSession()).id;
+        }
+      }
+      if (reused) console.log(`[affinity] reuse web session ${String(sessionId).slice(0, 8)} (msgs ${(messages || []).length})`);
       if (dsmlDebugEnabled()) {
         console.error(`[dsml] prompt chatcmpl-${String(sessionId).slice(0, 8)}: len=${prompt.length} tools=${Array.isArray(tools) ? tools.length : 0} preview=${JSON.stringify(previewStr(prompt, 1000))}`);
       }
@@ -205,7 +296,7 @@ async function main() {
           'X-Accel-Buffering': 'no',
         });
         const chunk = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
-        const base = { id: `chatcmpl-${sessionId.slice(0, 8)}`, object: 'chat.completion.chunk', created, model: respModel };
+        const base = { id: `chatcmpl-${sessionId.slice(0, 8)}`, object: 'chat.completion.chunk', created, model: respModel, session_id: sessionId };
         let closed = false;
         req.on('close', () => { closed = true; });
         try {
@@ -251,6 +342,7 @@ async function main() {
         }
         res.write('data: [DONE]\n\n');
         res.end();
+        upsertAffinity(sessionId, messages, fullPrompt);
       } else {
         let text = '', reasoning = '';
         for await (const ev of gen) {
@@ -269,6 +361,7 @@ async function main() {
         const msg = { role: 'assistant', content };
         if (thinking && reasoning) msg.reasoning_content = reasoning;
         if (toolCalls) msg.tool_calls = toolCalls;
+        upsertAffinity(sessionId, messages, fullPrompt);
         res.json({
           id: `chatcmpl-${sessionId.slice(0, 8)}`, object: 'chat.completion', created, model: respModel,
           session_id: sessionId,
@@ -285,10 +378,27 @@ async function main() {
   // ---- legacy completions ----
   app.post('/v1/completions', async (req, res) => {
     try {
-      const { model: modelName, prompt, stream, session_id } = req.body || {};
+      const { model: modelName, prompt: rawPrompt, stream, session_id } = req.body || {};
       const model = resolveModel(modelName);
-      const text = typeof prompt === 'string' ? prompt : messagesToPrompt([{ role: 'user', content: prompt }]);
-      const sessionId = session_id || (await ds.createSession()).id;
+      const fullText = typeof rawPrompt === 'string' ? rawPrompt : messagesToPrompt([{ role: 'user', content: rawPrompt }]);
+      let text = fullText;
+      let sessionId = session_id;
+      if (isAutoSessionId(sessionId)) {
+        if (!sessionAffinityEnabled()) {
+          sessionId = (await ds.createSession()).id;
+        } else {
+          const m = findAffinityByPrompt(fullText);
+          if (m) {
+            sessionId = m.sessionId;
+            const tail = fullText.slice(m.prompt.length);
+            if (tail.trim()) text = tail;
+          } else {
+            sessionId = (await ds.createSession()).id;
+          }
+        }
+      } else if (!sessionId) {
+        sessionId = (await ds.createSession()).id;
+      }
       const created = Math.floor(Date.now() / 1000);
       if (stream) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
@@ -300,8 +410,10 @@ async function main() {
         res.write(`data: ${JSON.stringify({ ...base, choices: [{ text: '', index: 0, finish_reason: 'stop' }] })}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
+        upsertAffinity(sessionId, [], fullText);
       } else {
         const { text: out } = await ds.complete({ sessionId, prompt: text });
+        upsertAffinity(sessionId, [], fullText);
         res.json({
           id: `cmpl-${sessionId.slice(0, 8)}`, object: 'text_completion', created, model: model.id,
           session_id: sessionId, choices: [{ text: out, index: 0, finish_reason: 'stop' }],
