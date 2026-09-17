@@ -213,8 +213,36 @@ func FirstDSMLStart(s string) int {
 	return -1
 }
 
+// isValidDSMLName reports whether s is a legal tool/parameter/attribute name.
+// Strict on purpose: the wire has been observed emitting corrupted tags like
+// `<parameter name="parameter name="code" ...>` when the model degrades at
+// large context. Naive quote scanning turns that into the bogus key
+// `parameter name=`; forwarding it (or a partial arg set) makes downstream
+// validators fail (e.g. opencode `read`: `Received arguments: {}` or missing
+// `path`/`code`). Reject anything outside [A-Za-z_][A-Za-z0-9_.-]*.
+func isValidDSMLName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' {
+			continue
+		}
+		if i > 0 && (c >= '0' && c <= '9' || c == '.' || c == '-') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // parseAttrs parses name="value" pairs (double or single quoted) from a tag
 // interior like ` name="bash" string="true" `. It tolerates extra whitespace.
+// Attribute names MUST be valid DSML identifiers; pairs with invalid names
+// (e.g. produced by nested-quote corruption like
+// `name="parameter name="code""`, which naive scanning would turn into the
+// bogus key `parameter name=`) are dropped instead of forwarded downstream.
 func parseAttrs(s string) map[string]string {
 	attrs := map[string]string{}
 	i := 0
@@ -253,7 +281,7 @@ func parseAttrs(s string) map[string]string {
 			for i < len(s) && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r' && s[i] != '>' {
 				i++
 			}
-			if name != "" {
+			if isValidDSMLName(name) {
 				attrs[name] = s[start:i]
 			}
 			continue
@@ -263,7 +291,7 @@ func parseAttrs(s string) map[string]string {
 		for i < len(s) && s[i] != q {
 			i++
 		}
-		if name != "" {
+		if isValidDSMLName(name) {
 			attrs[name] = s[start:i]
 		}
 		if i < len(s) {
@@ -421,17 +449,20 @@ func parseCallsBlock(s string, blockStart, blockEnd int, idBase, idStart int) []
 			continue
 		}
 		name := strings.TrimSpace(attrs["name"])
-		if name == "" {
+		if !isValidDSMLName(name) {
 			pos = closeEnd
-			continue // invoke without name: skip
+			continue // invoke without valid name: skip
 		}
 		args := map[string]string{}
 		ppos := iend
+		corrupt := false
+		attempted := false
 		for ppos < closePos {
 			pattrs, pstart, pend, pok := findOpenTag(s, ppos, "parameter")
 			if !pok || pstart >= closePos {
 				break
 			}
+			attempted = true
 			// find </parameter>
 			pcpos := -1
 			pcend := -1
@@ -451,16 +482,40 @@ func parseCallsBlock(s string, blockStart, blockEnd int, idBase, idStart int) []
 				pscan++
 			}
 			if pcpos < 0 {
-				ppos = pend // missing close: skip this parameter
+				corrupt = true // missing close: value boundary unknown
+				ppos = pend
 				continue
 			}
 			pname := strings.TrimSpace(pattrs["name"])
-			if pname == "" {
+			if !isValidDSMLName(pname) {
+				// Corrupted open tag (e.g. name="parameter name="code"").
+				// Forwarding a partial arg set (or a bogus key) makes
+				// downstream validation fail; drop the whole invoke.
+				corrupt = true
 				ppos = pcend
 				continue
 			}
-			args[pname] = trimParamValue(s[pend:pcpos])
+			// A valid name whose value still smells like a nested tag
+			// (model duplication) is also corruption, not a real value.
+			val := trimParamValue(s[pend:pcpos])
+			if strings.Contains(val, "parameter name=") {
+				corrupt = true
+				ppos = pcend
+				continue
+			}
+			args[pname] = val
 			ppos = pcend
+		}
+		if corrupt {
+			pos = closeEnd
+			continue // fail-safe: no partial/hallucinated call
+		}
+		if len(args) == 0 && attempted {
+			// All params failed but model tried to pass args: emitting
+			// arguments={} guarantees a downstream validation error
+			// (`path`/`code` missing). Emit nothing instead.
+			pos = closeEnd
+			continue
 		}
 		n++
 		tc := ToolCall{

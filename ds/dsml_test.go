@@ -157,16 +157,19 @@ func TestInvalidInputsFailSafe(t *testing.T) {
 			t.Fatalf("%s: expected 0 calls, got %+v", name, res.Calls)
 		}
 	}
-	// Parameter without a name is skipped but the invoke itself still parses.
+	// Parameter without a name is corruption, not a no-arg call: the whole
+	// invoke is dropped fail-safe (forwarding arguments={} makes downstream
+	// validators fail, e.g. opencode `read`: `Received arguments: {}`).
 	rawBadParam := wrapCalls(dsmlOpen("invoke", ` name="bash"`) + dsmlOpen("parameter", ``) + "x" + dsmlClose("parameter") + dsmlClose("invoke"))
-	if res := ParseDSML(rawBadParam); len(res.Calls) != 1 || len(res.Calls[0].Arguments) != 0 {
-		t.Fatalf("malformed parameter should yield call with no args: %+v", res)
+	if res := ParseDSML(rawBadParam); len(res.Calls) != 0 {
+		t.Fatalf("nameless parameter must drop the invoke: %+v", res)
 	}
-	// missing parameter close: invoke parses but yields no args, still one call
+	// missing parameter close: value boundary unknown -> drop invoke, no
+	// hallucinated empty-args call.
 	raw := wrapCalls(dsmlOpen("invoke", ` name="bash"`) + dsmlOpen("parameter", ` name="c"`) + "pwd" + dsmlClose("invoke"))
 	res := ParseDSML(raw)
-	if len(res.Calls) != 1 || len(res.Calls[0].Arguments) != 0 {
-		t.Fatalf("missing param close should yield call with no args: %+v", res)
+	if len(res.Calls) != 0 {
+		t.Fatalf("missing param close must yield no calls: %+v", res)
 	}
 }
 
@@ -386,5 +389,54 @@ func TestMixedSingleDoubleBars(t *testing.T) {
 	res := ParseDSML(raw)
 	if len(res.Calls) != 1 || res.Calls[0].Name != "bash" || res.Calls[0].Arguments["command"] != "pwd" {
 		t.Fatalf("%+v", res)
+	}
+}
+
+func TestNestedQuoteCorruptionDropsInvoke(t *testing.T) {
+	// Exact failure from live log (chatcmpl-059df584): model emitted
+	// `<parameter name="parameter name="code" ...>`. Naive parsing yields
+	// the bogus key `parameter name=`; must not be forwarded.
+	raw := wrapCalls(dsmlOpen("invoke", ` name="run_code"`) +
+		dsmlOpen("parameter", ` name="description" string="true"`) + "Read settings classes" + dsmlClose("parameter") +
+		`<｜DSML｜parameter name="parameter name="code" string="true">` + "x" + dsmlClose("parameter") +
+		dsmlClose("invoke"))
+	res := ParseDSML(raw)
+	if len(res.Calls) != 0 {
+		t.Fatalf("corrupt invoke must be dropped, got %+v", res.Calls)
+	}
+	for _, c := range res.Calls {
+		for k := range c.Arguments {
+			if !isValidDSMLName(k) {
+				t.Fatalf("invalid arg key forwarded: %q", k)
+			}
+		}
+	}
+}
+
+func TestBogusAttrKeyNeverForwarded(t *testing.T) {
+	attrs := parseAttrs(` name="parameter name="code" string="true"`)
+	for k := range attrs {
+		if !isValidDSMLName(k) {
+			t.Fatalf("parseAttrs leaked invalid key %q: %v", k, attrs)
+		}
+	}
+	if _, ok := attrs["parameter name="]; ok {
+		t.Fatalf("bogus key must be dropped: %v", attrs)
+	}
+}
+
+func TestEmptyArgsNeverEmitted(t *testing.T) {
+	// An invoke that attempted params but yielded none must not become {}.
+	raw := wrapCalls(dsmlOpen("invoke", ` name="read"`) +
+		dsmlOpen("parameter", ``) + "x" + dsmlClose("parameter") +
+		dsmlClose("invoke"))
+	if res := ParseDSML(raw); len(res.Calls) != 0 {
+		t.Fatalf("empty-args call must not be emitted: %+v", res.Calls)
+	}
+	// A genuinely parameter-less invoke (no <parameter> at all) still parses:
+	// some tools legitimately take no args.
+	rawNoParams := wrapCalls(dsmlOpen("invoke", ` name="ping"`) + dsmlClose("invoke"))
+	if res := ParseDSML(rawNoParams); len(res.Calls) != 1 {
+		t.Fatalf("no-param invoke must still parse: %+v", res)
 	}
 }
