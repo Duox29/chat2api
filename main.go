@@ -27,12 +27,12 @@ import (
 )
 
 type Model struct {
-	ID         string `json:"id"`
-	Object     string `json:"object"`
-	Created    int64  `json:"created"`
-	OwnedBy    string `json:"owned_by"`
-	ModelType  string `json:"-"`
-	Thinking   bool   `json:"-"`
+	ID        string `json:"id"`
+	Object    string `json:"object"`
+	Created   int64  `json:"created"`
+	OwnedBy   string `json:"owned_by"`
+	ModelType string `json:"-"`
+	Thinking  bool   `json:"-"`
 }
 
 var models = []Model{
@@ -63,47 +63,233 @@ func errJSON(w http.ResponseWriter, status int, msg string) {
 	})
 }
 
-// messagesToPrompt flattens OpenAI messages[] into one DeepSeek prompt.
+// dsmlDebugEnabled reports whether DSML raw logging is enabled.
+// Opt-in via DSML_DEBUG=1|true|yes|raw|on. Logs go to stderr, truncated.
+// It NEVER logs secrets: no API keys, tokens, cookies, or auth headers —
+// only the DeepSeek prompt/response text and the parsed tool calls.
+func dsmlDebugEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DSML_DEBUG"))) {
+	case "1", "true", "yes", "raw", "on":
+		return true
+	}
+	return false
+}
+
+// dsmlParsingEnabled reports whether DSML → tool_calls translation is active.
+// Default ON; set DSML_ENABLED=0|false|no|off to pass DeepSeek response text
+// through verbatim (pre-parser behavior, no tool_calls ever emitted).
+func dsmlParsingEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DSML_ENABLED"))) {
+	case "", "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// adaptDSML converts raw DeepSeek response text into OpenAI message content,
+// tool_calls and finish_reason, honoring the DSML_ENABLED toggle.
+func adaptDSML(text string) (content string, toolCalls []interface{}, finish string) {
+	if !dsmlParsingEnabled() {
+		return text, nil, "stop"
+	}
+	parsed := ds.ParseDSML(text)
+	if len(parsed.Calls) == 0 {
+		return parsed.CleanText, nil, "stop"
+	}
+	return parsed.CleanText, dsmlToOpenAIToolCalls(parsed.Calls), "tool_calls"
+}
+
+// previewRunes truncates s to n runes (rune-safe: never splits ｜ etc.).
+func previewRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + fmt.Sprintf("…[%d more runes]", len(r)-n)
+}
+
+// logDSMLRaw logs one DeepSeek response through the DSML adapter:
+// raw length + truncated raw text, detection result, clean text and the
+// normalized tool calls. No-op unless DSML_DEBUG is set.
+func logDSMLRaw(tag, raw string, res ds.ParseResult) {
+	if !dsmlDebugEnabled() {
+		return
+	}
+	log.Printf("[dsml] %s: raw_len=%d hasDSML=%v calls=%d clean=%q",
+		tag, len(raw), res.HasDSML, len(res.Calls), previewRunes(res.CleanText, 500))
+	log.Printf("[dsml] %s raw preview: %q", tag, previewRunes(raw, 4000))
+	for i, c := range res.Calls {
+		log.Printf("[dsml] %s call[%d]: name=%q args=%s",
+			tag, i, c.Name, previewRunes(c.ArgumentsJSON(), 1000))
+	}
+}
+
+// messageContentToString flattens OpenAI content (string | content-parts[]).
+func messageContentToString(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case []interface{}:
+		var b strings.Builder
+		for _, p := range t {
+			pm, _ := p.(map[string]interface{})
+			if pm == nil {
+				continue
+			}
+			switch pm["type"] {
+			case "text":
+				if s, ok := pm["text"].(string); ok {
+					b.WriteString(s + "\n")
+				}
+			case "input_text":
+				if s, ok := pm["text"].(string); ok {
+					b.WriteString(s + "\n")
+				}
+			}
+		}
+		return strings.TrimRight(b.String(), "\n")
+	}
+	return fmt.Sprint(v)
+}
+
+// formatIncomingToolCalls renders an assistant message's tool_calls for the
+// DeepSeek prompt so multi-turn agentic loops keep working.
+func formatIncomingToolCalls(m map[string]interface{}) string {
+	raw, ok := m["tool_calls"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nAssistant tool calls:")
+	for _, tc := range raw {
+		tm, _ := tc.(map[string]interface{})
+		if tm == nil {
+			continue
+		}
+		id, _ := tm["id"].(string)
+		fn, _ := tm["function"].(map[string]interface{})
+		name := ""
+		args := ""
+		if fn != nil {
+			name, _ = fn["name"].(string)
+			args, _ = fn["arguments"].(string)
+			if args == "" {
+				if av, ok := fn["arguments"]; ok && av != nil {
+					args = fmt.Sprint(av)
+				}
+			}
+		}
+		if name == "" {
+			name, _ = tm["name"].(string)
+		}
+		fmt.Fprintf(&b, "\n- id=%s name=%s arguments=%s", id, name, args)
+	}
+	return b.String()
+}
+
+// messagesToPrompt flattens OpenAI messages[] into one DeepSeek prompt,
+// preserving assistant tool_calls and tool results for agentic follow-ups.
 func messagesToPrompt(messages []map[string]interface{}) string {
 	if len(messages) == 0 {
 		return ""
 	}
-	str := func(v interface{}) string {
-		switch t := v.(type) {
-		case string:
-			return t
-		case []interface{}:
-			var b strings.Builder
-			for _, p := range t {
-				pm, _ := p.(map[string]interface{})
-				if pm["type"] == "text" {
-					if s, ok := pm["text"].(string); ok {
-						b.WriteString(s + "\n")
-					}
-				}
-			}
-			return strings.TrimRight(b.String(), "\n")
-		}
-		return fmt.Sprint(v)
-	}
 	if len(messages) == 1 {
-		return str(messages[0]["content"])
+		m := messages[0]
+		s := messageContentToString(m["content"])
+		if tc := formatIncomingToolCalls(m); tc != "" {
+			s += tc
+		}
+		return s
 	}
 	var b strings.Builder
 	for _, m := range messages {
 		role, _ := m["role"].(string)
-		var label string
+		content := messageContentToString(m["content"])
 		switch role {
-		case "assistant":
-			label = "Assistant"
 		case "system":
-			label = "System"
+			b.WriteString("System: " + content + "\n\n")
+		case "assistant":
+			b.WriteString("Assistant: " + content + formatIncomingToolCalls(m) + "\n\n")
+		case "tool", "function":
+			name, _ := m["name"].(string)
+			callID, _ := m["tool_call_id"].(string)
+			if callID == "" {
+				callID, _ = m["id"].(string)
+			}
+			if name != "" && callID != "" {
+				fmt.Fprintf(&b, "Tool result for %s (id %s):\n%s\n\n", name, callID, content)
+			} else if name != "" {
+				fmt.Fprintf(&b, "Tool result for %s:\n%s\n\n", name, content)
+			} else {
+				b.WriteString("Tool result:\n" + content + "\n\n")
+			}
 		default:
-			label = "User"
+			b.WriteString("User: " + content + "\n\n")
 		}
-		b.WriteString(label + ": " + str(m["content"]) + "\n\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// appendToolsSection translates the OpenAI tools[] list into DSML usage
+// instructions appended to the DeepSeek prompt. This is a protocol translation
+// (DeepSeek web has no native function-calling field), not prompt engineering
+// to suppress DSML: it tells the model HOW to emit DSML for the declared tools.
+func appendToolsSection(prompt string, tools []map[string]interface{}) string {
+	if len(tools) == 0 {
+		return prompt
+	}
+	var b strings.Builder
+	b.WriteString(prompt)
+	b.WriteString("\n\nAvailable tools (invoke them with DSML blocks). Schemas (JSON):")
+	for _, t := range tools {
+		name := ""
+		desc := ""
+		params := ""
+		if fn, ok := t["function"].(map[string]interface{}); ok {
+			name, _ = fn["name"].(string)
+			desc, _ = fn["description"].(string)
+			if p, ok := fn["parameters"]; ok && p != nil {
+				if pb, err := json.Marshal(p); err == nil {
+					params = string(pb)
+				}
+			}
+		} else {
+			name, _ = t["name"].(string)
+			desc, _ = t["description"].(string)
+		}
+		if name == "" {
+			continue
+		}
+		b.WriteString("\n- " + name)
+		if desc != "" {
+			b.WriteString(": " + desc)
+		}
+		if params != "" {
+			b.WriteString(" Parameters: " + params)
+		}
+	}
+	b.WriteString("\nDSML format (use the exact fullwidth delimiters):")
+	b.WriteString("\n<｜DSML｜calls>\n<｜DSML｜invoke name=\"TOOL_NAME\">\n<｜DSML｜parameter name=\"PARAM_NAME\" string=\"true\">\nVALUE\n</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜calls>")
+	b.WriteString("\nRules: keep parameter names/values exact; multiple invokes and parameters allowed; text outside DSML blocks is the assistant reply.")
+	return b.String()
+}
+
+// dsmlToOpenAIToolCalls converts normalized DSML calls to OpenAI tool_calls.
+func dsmlToOpenAIToolCalls(calls []ds.ToolCall) []interface{} {
+	out := make([]interface{}, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, map[string]interface{}{
+			"id":   c.ID,
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      c.Name,
+				"arguments": c.ArgumentsJSON(),
+			},
+		})
+	}
+	return out
 }
 
 func main() {
@@ -196,6 +382,7 @@ func main() {
 		var req struct {
 			Model           string                   `json:"model"`
 			Messages        []map[string]interface{} `json:"messages"`
+			Tools           []map[string]interface{} `json:"tools"`
 			Stream          bool                     `json:"stream"`
 			SessionID       string                   `json:"session_id"`
 			ThinkingEnabled *bool                    `json:"thinking_enabled"`
@@ -206,11 +393,12 @@ func main() {
 			return
 		}
 		model := resolveModel(req.Model)
-		prompt := messagesToPrompt(req.Messages)
+		prompt := appendToolsSection(messagesToPrompt(req.Messages), req.Tools)
 		if strings.TrimSpace(prompt) == "" {
 			errJSON(w, 400, "messages is required")
 			return
 		}
+
 		thinking := model.Thinking
 		if req.ThinkingEnabled != nil {
 			thinking = *req.ThinkingEnabled
@@ -238,6 +426,10 @@ func main() {
 		}
 		created := time.Now().Unix()
 		chatID := "chatcmpl-" + shortID(sessionID)
+		if dsmlDebugEnabled() {
+			log.Printf("[dsml] prompt %s: len=%d tools=%d preview=%q",
+				chatID, len(prompt), len(req.Tools), previewRunes(prompt, 1000))
+		}
 
 		if req.Stream {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -265,10 +457,36 @@ func main() {
 					fl.Flush()
 				}
 			}
+			// DSML-aware streaming: raw DSML bytes are never forwarded as
+			// content. Safe text flows incrementally; tool_calls are emitted
+			// once the DeepSeek stream finishes.
+			// When DSML_ENABLED=0 the filter is bypassed and deltas pass through
+			// verbatim (no tool_calls ever emitted).
+			var filter ds.StreamFilter
+			dsmlPassthrough := !dsmlParsingEnabled()
+			toolChunk := func(index int, tc ds.ToolCall) {
+				chunk(map[string]interface{}{
+					"tool_calls": []interface{}{map[string]interface{}{
+						"index": index,
+						"id":    tc.ID,
+						"type":  "function",
+						"function": map[string]interface{}{
+							"name":      tc.Name,
+							"arguments": tc.ArgumentsJSON(),
+						},
+					}},
+				}, "")
+			}
 			_, err := client.StreamCompletion(ctx, opt, func(e ds.Event) {
 				switch e.Type {
 				case "text":
-					chunk(map[string]interface{}{"content": e.Delta}, "")
+					if dsmlPassthrough {
+						chunk(map[string]interface{}{"content": e.Delta}, "")
+						break
+					}
+					if safe := filter.Write(e.Delta); safe != "" {
+						chunk(map[string]interface{}{"content": safe}, "")
+					}
 				case "thinking":
 					if thinking {
 						chunk(map[string]interface{}{"reasoning_content": e.Delta}, "")
@@ -280,6 +498,28 @@ func main() {
 			})
 			if err != nil {
 				chunk(map[string]interface{}{}, "error")
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				return
+			}
+			rest, calls := filter.Flush()
+			if dsmlPassthrough {
+				calls = nil
+				rest = ""
+				if dsmlDebugEnabled() {
+					log.Printf("[dsml] stream %s: parser disabled, passthrough", chatID)
+				}
+			} else if dsmlDebugEnabled() {
+				// Re-parse the buffered raw text for the debug summary.
+				logDSMLRaw("stream "+chatID, filter.Raw(), ds.ParseDSML(filter.Raw()))
+			}
+			if rest != "" {
+				chunk(map[string]interface{}{"content": rest}, "")
+			}
+			for i, tc := range calls {
+				toolChunk(i, tc)
+			}
+			if len(calls) > 0 {
+				chunk(map[string]interface{}{}, "tool_calls")
 			} else {
 				chunk(map[string]interface{}{}, "stop")
 			}
@@ -292,15 +532,26 @@ func main() {
 			errJSON(w, 502, err.Error())
 			return
 		}
-		msg := map[string]interface{}{"role": "assistant", "content": text}
+		content, toolCalls, finish := adaptDSML(text)
+		if dsmlDebugEnabled() {
+			if dsmlParsingEnabled() {
+				logDSMLRaw("non-stream "+chatID, text, ds.ParseDSML(text))
+			} else {
+				log.Printf("[dsml] non-stream %s: parser disabled, passthrough len=%d", chatID, len(text))
+			}
+		}
+		msg := map[string]interface{}{"role": "assistant", "content": content}
 		if thinking && reasoning != "" {
 			msg["reasoning_content"] = reasoning
+		}
+		if len(toolCalls) > 0 {
+			msg["tool_calls"] = toolCalls
 		}
 		writeJSON(w, 200, map[string]interface{}{
 			"id": chatID, "object": "chat.completion", "created": created, "model": model.ID,
 			"session_id": sessionID,
 			"choices": []interface{}{map[string]interface{}{
-				"index": 0, "message": msg, "finish_reason": "stop",
+				"index": 0, "message": msg, "finish_reason": finish,
 			}},
 			"usage": map[string]int{"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1},
 		})

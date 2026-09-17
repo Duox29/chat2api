@@ -44,6 +44,8 @@ Biến môi trường:
 | `GATEWAY_API_KEY` | (trống = mở) | Nếu đặt, client phải gửi `Authorization: Bearer <key>` |
 | `REPO_DIR` | `.` | Thư mục repo (chứa `account.json`, `scripts/`, `state/`) |
 | `CHROME_PATH` | đường dẫn ms-playwright | Dùng khi Chromium nằm chỗ khác |
+| `DSML_DEBUG` | (trống = tắt) | Đặt `1` để log raw DeepSeek response + DSML parse/tool calls ra stderr (truncated, không bao giờ log key/token/cookie). Chỉ bật khi debug. |
+| `DSML_ENABLED` | `1` (bật) | Đặt `0` để tắt DSML parser: response DeepSeek trả về nguyên văn text, không bao giờ emit `tool_calls`. |
 
 Gateway tự re-login khi token hết hạn (401/403), không cần can thiệp.
 

@@ -16,6 +16,7 @@
 const express = require('express');
 const cors = require('cors');
 const { DeepSeekClient } = require('./deepseek');
+const { parseDSML, StreamFilter } = require('./dsml');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const API_KEY = process.env.GATEWAY_API_KEY || '';
@@ -30,17 +31,109 @@ function resolveModel(name) {
   return m || MODELS[0];
 }
 
-/** Flatten OpenAI messages[] into one DeepSeek prompt. */
+function contentToString(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.filter(p => p && (p.type === 'text' || p.type === 'input_text'))
+      .map(p => p.text).join('\n');
+  }
+  return String(content);
+}
+
+function formatIncomingToolCalls(m) {
+  const tcs = m.tool_calls;
+  if (!Array.isArray(tcs) || tcs.length === 0) return '';
+  let s = '\nAssistant tool calls:';
+  for (const tc of tcs) {
+    const fn = tc.function || {};
+    s += `\n- id=${tc.id || ''} name=${fn.name || tc.name || ''} arguments=${fn.arguments || ''}`;
+  }
+  return s;
+}
+
+/** Flatten OpenAI messages[] into one DeepSeek prompt (tool-aware). */
 function messagesToPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return '';
-  if (messages.length === 1) return String(messages[0].content ?? '');
+  if (messages.length === 1) {
+    const m = messages[0];
+    return contentToString(m.content) + formatIncomingToolCalls(m);
+  }
   return messages.map(m => {
-    const role = m.role === 'assistant' ? 'Assistant' : m.role === 'system' ? 'System' : 'User';
-    const content = Array.isArray(m.content)
-      ? m.content.filter(p => p.type === 'text').map(p => p.text).join('\n')
-      : String(m.content ?? '');
-    return `${role}: ${content}`;
+    const content = contentToString(m.content);
+    if (m.role === 'assistant') return `Assistant: ${content}${formatIncomingToolCalls(m)}`;
+    if (m.role === 'system') return `System: ${content}`;
+    if (m.role === 'tool' || m.role === 'function') {
+      const name = m.name || '';
+      const callId = m.tool_call_id || m.id || '';
+      if (name && callId) return `Tool result for ${name} (id ${callId}):\n${content}`;
+      if (name) return `Tool result for ${name}:\n${content}`;
+      return `Tool result:\n${content}`;
+    }
+    return `User: ${content}`;
   }).join('\n\n');
+}
+
+/** Translate OpenAI tools[] into DSML usage instructions for DeepSeek web. */
+function appendToolsSection(prompt, tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return prompt;
+  let s = prompt + '\n\nAvailable tools (invoke them with DSML blocks). Schemas (JSON):';
+  for (const t of tools) {
+    const fn = t.function || t;
+    if (!fn.name) continue;
+    s += `\n- ${fn.name}`;
+    if (fn.description) s += `: ${fn.description}`;
+    if (fn.parameters) {
+      try { s += ` Parameters: ${JSON.stringify(fn.parameters)}`; } catch (_) {}
+    }
+  }
+  s += '\nDSML format (use the exact fullwidth delimiters):';
+  s += '\n<｜DSML｜calls>\n<｜DSML｜invoke name="TOOL_NAME">\n<｜DSML｜parameter name="PARAM_NAME" string="true">\nVALUE\n</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜calls>';
+  s += '\nRules: keep parameter names/values exact; multiple invokes and parameters allowed; text outside DSML blocks is the assistant reply.';
+  return s;
+}
+
+function dsmlToOpenAIToolCalls(calls) {
+  return calls.map(c => ({
+    id: c.id, type: 'function',
+    function: { name: c.name, arguments: JSON.stringify(c.arguments || {}) },
+  }));
+}
+
+// DSML parser toggle. Default ON; set DSML_ENABLED=0|false|no|off to pass
+// DeepSeek response text through verbatim (no tool_calls ever emitted).
+function dsmlParsingEnabled() {
+  return ['', '1', 'true', 'yes', 'on'].includes(String(process.env.DSML_ENABLED ?? '').toLowerCase().trim());
+}
+
+// Convert raw DeepSeek response text to OpenAI content/tool_calls/finish,
+// honoring the DSML_ENABLED toggle.
+function adaptDSML(text) {
+  if (!dsmlParsingEnabled()) return { content: text, toolCalls: null, finish: 'stop' };
+  const parsed = parseDSML(text);
+  if (!parsed.calls.length) return { content: parsed.cleanText, toolCalls: null, finish: 'stop' };
+  return { content: parsed.cleanText, toolCalls: dsmlToOpenAIToolCalls(parsed.calls), finish: 'tool_calls' };
+}
+
+// Opt-in raw logging via DSML_DEBUG=1|true|yes|raw|on (stderr, truncated).
+// NEVER logs secrets: no API keys, tokens, cookies, or auth headers — only
+// the DeepSeek prompt/response text and parsed tool calls.
+function dsmlDebugEnabled() {
+  return ['1', 'true', 'yes', 'raw', 'on'].includes(String(process.env.DSML_DEBUG || '').toLowerCase().trim());
+}
+
+// Code-point-safe truncation (never splits ｜ etc.).
+function previewStr(s, n) {
+  const a = Array.from(String(s ?? ''));
+  return a.length <= n ? a.join('') : a.slice(0, n).join('') + `…[${a.length - n} more chars]`;
+}
+
+function logDSMLRaw(tag, raw, parsed) {
+  if (!dsmlDebugEnabled()) return;
+  console.error(`[dsml] ${tag}: raw_len=${raw.length} hasDSML=${parsed.hasDSML} calls=${parsed.calls.length} clean=${JSON.stringify(previewStr(parsed.cleanText, 500))}`);
+  console.error(`[dsml] ${tag} raw preview: ${JSON.stringify(previewStr(raw, 4000))}`);
+  parsed.calls.forEach((c, i) => console.error(
+    `[dsml] ${tag} call[${i}]: name=${JSON.stringify(c.name)} args=${previewStr(JSON.stringify(c.arguments || {}), 1000)}`));
 }
 
 function checkAuth(req, res, next) {
@@ -90,13 +183,16 @@ async function main() {
   // ---- chat completions ----
   app.post('/v1/chat/completions', async (req, res) => {
     try {
-      const { model: modelName, messages, stream, session_id, thinking_enabled, search_enabled } = req.body || {};
+      const { model: modelName, messages, tools, stream, session_id, thinking_enabled, search_enabled } = req.body || {};
       const model = resolveModel(modelName);
-      const prompt = messagesToPrompt(messages);
+      const prompt = appendToolsSection(messagesToPrompt(messages), tools);
       if (!prompt) return res.status(400).json({ error: { message: 'messages is required' } });
 
       const thinking = thinking_enabled ?? model.thinking;
       const sessionId = session_id || (await ds.createSession()).id;
+      if (dsmlDebugEnabled()) {
+        console.error(`[dsml] prompt chatcmpl-${String(sessionId).slice(0, 8)}: len=${prompt.length} tools=${Array.isArray(tools) ? tools.length : 0} preview=${JSON.stringify(previewStr(prompt, 1000))}`);
+      }
       const gen = ds.completionStream({ sessionId, prompt, thinkingEnabled: !!thinking, searchEnabled: !!search_enabled });
       const created = Math.floor(Date.now() / 1000);
       const respModel = model.id;
@@ -113,16 +209,46 @@ async function main() {
         let closed = false;
         req.on('close', () => { closed = true; });
         try {
+          const filter = new StreamFilter();
+          const dsmlPassthrough = !dsmlParsingEnabled();
           for await (const ev of gen) {
             if (closed) break;
-            if (ev.type === 'text') chunk({ ...base, choices: [{ index: 0, delta: { content: ev.delta }, finish_reason: null }] });
+            if (ev.type === 'text') {
+              if (dsmlPassthrough) {
+                chunk({ ...base, choices: [{ index: 0, delta: { content: ev.delta }, finish_reason: null }] });
+                continue;
+              }
+              const safe = filter.write(ev.delta);
+              if (safe) chunk({ ...base, choices: [{ index: 0, delta: { content: safe }, finish_reason: null }] });
+            }
             else if (ev.type === 'thinking' && thinking) chunk({ ...base, choices: [{ index: 0, delta: { reasoning_content: ev.delta }, finish_reason: null }] });
             else if (ev.type === 'done') break;
+          }
+          if (!closed) {
+            let { rest, calls } = filter.flush();
+            if (dsmlPassthrough) {
+              rest = ''; calls = [];
+              if (dsmlDebugEnabled()) console.error(`[dsml] stream chatcmpl-${String(sessionId).slice(0, 8)}: parser disabled, passthrough`);
+            } else if (dsmlDebugEnabled()) {
+              logDSMLRaw(`stream chatcmpl-${String(sessionId).slice(0, 8)}`, filter.getRaw(), parseDSML(filter.getRaw()));
+            }
+            if (rest) chunk({ ...base, choices: [{ index: 0, delta: { content: rest }, finish_reason: null }] });
+            calls.forEach((c, i) => chunk({
+              ...base, choices: [{
+                index: 0,
+                delta: {
+                  tool_calls: [{
+                    index: i, id: c.id, type: 'function',
+                    function: { name: c.name, arguments: JSON.stringify(c.arguments || {}) },
+                  }],
+                }, finish_reason: null,
+              }],
+            }));
+            chunk({ ...base, choices: [{ index: 0, delta: {}, finish_reason: calls.length ? 'tool_calls' : 'stop' }] });
           }
         } catch (e) {
           chunk({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'error' }], error: String(e.message || e) });
         }
-        chunk({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
         res.write('data: [DONE]\n\n');
         res.end();
       } else {
@@ -132,12 +258,21 @@ async function main() {
           else if (ev.type === 'thinking') reasoning += ev.delta;
           else if (ev.type === 'done') break;
         }
-        const msg = { role: 'assistant', content: text };
+        const { content, toolCalls, finish } = adaptDSML(text);
+        if (dsmlDebugEnabled()) {
+          if (dsmlParsingEnabled()) {
+            logDSMLRaw(`non-stream chatcmpl-${String(sessionId).slice(0, 8)}`, text, parseDSML(text));
+          } else {
+            console.error(`[dsml] non-stream chatcmpl-${String(sessionId).slice(0, 8)}: parser disabled, passthrough len=${text.length}`);
+          }
+        }
+        const msg = { role: 'assistant', content };
         if (thinking && reasoning) msg.reasoning_content = reasoning;
+        if (toolCalls) msg.tool_calls = toolCalls;
         res.json({
           id: `chatcmpl-${sessionId.slice(0, 8)}`, object: 'chat.completion', created, model: respModel,
           session_id: sessionId,
-          choices: [{ index: 0, message: msg, finish_reason: 'stop' }],
+          choices: [{ index: 0, message: msg, finish_reason: finish }],
           usage: { prompt_tokens: -1, completion_tokens: -1, total_tokens: -1 },
         });
       }
