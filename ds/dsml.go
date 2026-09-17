@@ -25,6 +25,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // ToolCall is a normalized tool invocation extracted from DSML.
@@ -516,12 +518,32 @@ func ParseDSML(text string) ParseResult {
 		calls = append(calls, blockCalls...)
 		pos = closeEnd
 	}
-	clean := strings.TrimSpace(out.String())
-	// Collapse 3+ consecutive newlines left by block removal.
-	for strings.Contains(clean, "\n\n\n") {
-		clean = strings.ReplaceAll(clean, "\n\n\n", "\n\n")
+	return ParseResult{CleanText: cleanDSMLText(out.String()), Calls: calls, HasDSML: found}
+}
+
+// collapseNewlines reduces runs of 3+ newlines (left by block removal)
+// to a blank line.
+func collapseNewlines(s string) string {
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}
-	return ParseResult{CleanText: clean, Calls: calls, HasDSML: found}
+	return s
+}
+
+// cleanDSMLText is ParseDSML's final normalization: trim surrounding
+// whitespace and collapse newlines left by block removal.
+func cleanDSMLText(s string) string {
+	return collapseNewlines(strings.TrimSpace(s))
+}
+
+// cleanDSMLPrefix maps already-streamed raw bytes into CleanText space. The
+// emitted region is guaranteed DSML-free (Write stops before any potential
+// tag), so modulo leading trim it is a prefix of the final CleanText.
+// Unlike cleanDSMLText it must NOT trim trailing whitespace: the emitted
+// region is an interior prefix of the final text, so trailing newlines may
+// be significant.
+func cleanDSMLPrefix(s string) string {
+	return collapseNewlines(strings.TrimLeftFunc(s, unicode.IsSpace))
 }
 
 // ArgumentsJSON marshals a ToolCall's arguments to the JSON-object string
@@ -542,12 +564,13 @@ func (c ToolCall) ArgumentsJSON() string {
 // newly-safe text prefix that can be forwarded immediately. At the end of the
 // stream call Flush to get the remaining safe text plus all parsed calls.
 //
-// Guarantee: raw DSML bytes are never returned as safe text; safe text is
-// always a prefix of the final CleanText.
+// Guarantee: raw DSML bytes are never returned as safe text. Write emits the
+// DSML-free raw prefix verbatim (leading whitespace included); Flush maps the
+// already-emitted bytes into CleanText space and returns only the remainder,
+// so streamed text is never duplicated.
 type StreamFilter struct {
-	raw      strings.Builder
-	emitted  int // bytes of raw already released as safe text
-	cleanLen int // bytes of CleanText already emitted
+	raw     strings.Builder
+	emitted int // bytes of raw already released as safe text
 }
 
 // Raw returns the full accumulated raw text (including buffered DSML).
@@ -576,25 +599,34 @@ func (f *StreamFilter) Write(delta string) string {
 }
 
 // Flush parses the full buffered raw text and returns the remaining safe text
-// (suffix of CleanText after what Write already released) and all tool calls.
+// (CleanText suffix after what Write already released) and all tool calls.
 func (f *StreamFilter) Flush() (string, []ToolCall) {
 	res := ParseDSML(f.raw.String())
-	rest := ""
-	if f.cleanLen < len(res.CleanText) {
-		// Write already emitted raw[:emitted], which is a prefix of CleanText
-		// (everything before the first DSML marker is untouched by parsing).
-		// Reconcile defensively: only slice when the prefix matches.
-		if len(res.CleanText) >= f.emitted && res.CleanText[:f.emitted] == f.raw.String()[:f.emitted] {
-			rest = res.CleanText[f.emitted:]
-			f.cleanLen = len(res.CleanText)
-		} else {
-			// Fallback (should not happen): emit CleanText suffix beyond what
-			// was already sent, capped at non-negative length.
-			if len(res.CleanText) > f.cleanLen {
-				rest = res.CleanText[f.cleanLen:]
-				f.cleanLen = len(res.CleanText)
-			}
-		}
+	if res.CleanText == "" {
+		return "", res.Calls
 	}
-	return rest, res.Calls
+	// Write released raw[:emitted] verbatim, while CleanText is trimmed and
+	// newline-collapsed — raw byte counts are meaningless in CleanText
+	// space. Map the emitted region through the same normalization (sans
+	// trailing trim, since it is an interior prefix) and strip exactly that.
+	prefix := cleanDSMLPrefix(f.raw.String()[:f.emitted])
+	if strings.HasPrefix(res.CleanText, prefix) {
+		return res.CleanText[len(prefix):], res.Calls
+	}
+	if strings.HasPrefix(prefix, res.CleanText) {
+		// Everything already streamed (plus trailing whitespace that
+		// CleanText trims). Nothing left to send.
+		return "", res.Calls
+	}
+	// Defensive fallback (e.g. a newline-collapse spanning the emit
+	// boundary): strip the longest common prefix so text is never
+	// re-emitted, keeping a valid UTF-8 boundary.
+	n := 0
+	for n < len(prefix) && n < len(res.CleanText) && prefix[n] == res.CleanText[n] {
+		n++
+	}
+	for n > 0 && n < len(res.CleanText) && !utf8.RuneStart(res.CleanText[n]) {
+		n--
+	}
+	return res.CleanText[n:], res.Calls
 }

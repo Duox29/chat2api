@@ -321,6 +321,63 @@ func TestDoubleBarVariant(t *testing.T) {
 	}
 }
 
+func TestStreamFilterNeverDuplicates(t *testing.T) {
+	// Verbatim repro: leading blank lines + trailing newline before a block.
+	// Write releases the raw prefix verbatim; Flush must return only the
+	// remainder, not the whole cleaned text again.
+	block := wrapCalls(dsmlOpen("invoke", ` name="bash"`)+
+		dsmlOpen("parameter", ` name="command" string="true"`)+"pwd"+dsmlClose("parameter")+
+		dsmlClose("invoke"))
+	delta := "\n\nHello there.\n" + block
+	var f StreamFilter
+	safe := f.Write(delta)
+	rest, calls := f.Flush()
+	if len(calls) != 1 {
+		t.Fatalf("calls=%+v", calls)
+	}
+	if total := safe + rest; total != "\n\nHello there.\n" {
+		t.Fatalf("duplicated/corrupt total=%q (safe=%q rest=%q)", total, safe, rest)
+	}
+}
+
+func TestStreamFilterLeadingWhitespaceNoDSML(t *testing.T) {
+	// No DSML at all: TrimSpace in CleanText must not cause re-emission.
+	var f StreamFilter
+	safe := f.Write("\n\nHello")
+	rest, _ := f.Flush()
+	if total := safe + rest; total != "\n\nHello" {
+		t.Fatalf("total=%q (safe=%q rest=%q)", total, safe, rest)
+	}
+}
+
+func TestStreamFilterChunkedEqualsCleanText(t *testing.T) {
+	// Without leading/trailing whitespace, chunked streaming must reassemble
+	// to exactly ParseDSML(full).CleanText — no duplication, no loss.
+	full := "I will inspect.\n" + wrapCalls(dsmlOpen("invoke", ` name="bash"`)+
+		dsmlOpen("parameter", ` name="command" string="true"`)+"\nls -la\n"+dsmlClose("parameter")+
+		dsmlClose("invoke")) + "\nDone."
+	want := ParseDSML(full).CleanText
+	for _, size := range []int{1, 2, 3, 5, 7, 64} {
+		var f StreamFilter
+		var sb strings.Builder
+		for i := 0; i < len(full); i += size {
+			end := i + size
+			if end > len(full) {
+				end = len(full)
+			}
+			sb.WriteString(f.Write(full[i:end]))
+		}
+		rest, calls := f.Flush()
+		sb.WriteString(rest)
+		if len(calls) != 1 {
+			t.Fatalf("size=%d calls=%+v", size, calls)
+		}
+		if sb.String() != want {
+			t.Fatalf("size=%d total=%q want=%q", size, sb.String(), want)
+		}
+	}
+}
+
 func TestMixedSingleDoubleBars(t *testing.T) {
 	raw := "<｜DSML｜calls>" +
 		"<｜｜DSML｜｜invoke name=\"bash\">" +

@@ -49,6 +49,7 @@ type Client struct {
 	mu         sync.Mutex
 	sess       Session
 	loginMu    sync.Mutex
+	loginSeq   uint64 // successful runLogin count; de-dupes concurrent refresh (guarded by mu)
 	lastMsg    map[string]int64 // sessionID -> last assistant message id (for multi-turn)
 	tzOffset   string
 	apiKey     string
@@ -132,11 +133,23 @@ func (c *Client) headers(extra map[string]string) http.Header {
 }
 
 // runLogin shells out to the headless-browser login script.
+// Concurrent callers serialize on loginMu and de-duplicate: the login
+// sequence number is captured before waiting for the lock and re-checked
+// inside it, so N concurrent refresh triggers cause a single browser launch
+// (~10-30s each). A generation counter (not the token value) is used because
+// a refresh may legitimately yield the same token with rotated cookies.
 func (c *Client) runLogin(ctx context.Context) error {
+	c.mu.Lock()
+	before := c.loginSeq
+	c.mu.Unlock()
 	c.loginMu.Lock()
 	defer c.loginMu.Unlock()
-	// Another goroutine may have refreshed already.
-	before := c.currentToken()
+	c.mu.Lock()
+	refreshed := c.loginSeq != before
+	c.mu.Unlock()
+	if refreshed {
+		return nil // another goroutine refreshed while we waited
+	}
 	cmd := exec.CommandContext(ctx, "node", "scripts/login.js")
 	cmd.Dir = c.rootDir
 	out, err := cmd.CombinedOutput()
@@ -147,9 +160,9 @@ func (c *Client) runLogin(ctx context.Context) error {
 	if c.currentToken() == "" {
 		return fmt.Errorf("browser login produced no token: %s", truncate(string(out), 300))
 	}
-	if c.currentToken() == before {
-		// Token unchanged; still fine (cookies may have rotated).
-	}
+	c.mu.Lock()
+	c.loginSeq++
+	c.mu.Unlock()
 	return nil
 }
 

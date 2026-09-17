@@ -180,6 +180,18 @@ function parseCallsBlock(s, blockStart, blockEnd, idStart) {
   return calls;
 }
 
+function collapseNewlines(s) {
+  while (s.includes('\n\n\n')) s = s.split('\n\n\n').join('\n\n');
+  return s;
+}
+
+// Maps already-streamed raw bytes into cleanText space: same normalization
+// as parseDSML but without trailing trim, since the emitted region is an
+// interior prefix of the final text.
+function cleanPrefixFor(s) {
+  return collapseNewlines(s.replace(/^\s+/, ''));
+}
+
 function parseDSML(text) {
   const calls = [];
   let out = '';
@@ -202,8 +214,7 @@ function parseDSML(text) {
     calls.push(...parseCallsBlock(text, c.end, closePos, calls.length));
     pos = closeEnd;
   }
-  let clean = out.trim();
-  while (clean.includes('\n\n\n')) clean = clean.split('\n\n\n').join('\n\n');
+  const clean = collapseNewlines(out.trim());
   return { cleanText: clean, calls, hasDSML: found };
 }
 
@@ -227,14 +238,20 @@ class StreamFilter {
   }
   flush() {
     const res = parseDSML(this.raw);
-    let rest = '';
-    if (res.cleanText.length >= this.emitted &&
-        res.cleanText.slice(0, this.emitted) === this.raw.slice(0, this.emitted)) {
-      rest = res.cleanText.slice(this.emitted);
-    } else if (res.cleanText.length > 0) {
-      rest = res.cleanText.slice(Math.min(this.emitted, res.cleanText.length));
+    if (!res.cleanText) return { rest: '', calls: res.calls };
+    // Write released raw bytes verbatim while cleanText is trimmed: map the
+    // emitted region into cleanText space and strip exactly that, so text is
+    // never re-emitted.
+    const prefix = cleanPrefixFor(this.raw.slice(0, this.emitted));
+    if (res.cleanText.startsWith(prefix)) {
+      return { rest: res.cleanText.slice(prefix.length), calls: res.calls };
     }
-    return { rest, calls: res.calls };
+    if (prefix.startsWith(res.cleanText)) return { rest: '', calls: res.calls };
+    // Defensive fallback: strip longest common prefix (code-point safe).
+    let n = 0;
+    while (n < prefix.length && n < res.cleanText.length && prefix[n] === res.cleanText[n]) n++;
+    while (n > 0 && n < res.cleanText.length && /[\uDC00-\uDFFF]/.test(res.cleanText[n])) n--;
+    return { rest: res.cleanText.slice(n), calls: res.calls };
   }
 }
 
