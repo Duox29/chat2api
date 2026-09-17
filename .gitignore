@@ -1,0 +1,7 @@
+node_modules/
+state/
+*.log
+.idea/
+account.json
+chat2api
+chat2api.exe
