@@ -12,7 +12,37 @@ const { chromium } = require('playwright-core');
 
 const ROOT = path.join(__dirname, '..');
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-const EXEC = process.env.CHROME_PATH || (process.env.HOME + '/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');
+
+// Auto-detect installed Chromium: CHROME_PATH > Playwright cache > system chrome.
+function findChrome() {
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
+  const cache = path.join(process.env.HOME || process.env.USERPROFILE || '', '.cache', 'ms-playwright');
+  try {
+    for (const d of fs.readdirSync(cache)) {
+      if (!d.startsWith('chromium-')) continue;
+      for (const sub of fs.readdirSync(path.join(cache, d))) {
+        for (const bin of ['chrome', 'chrome.exe', 'headless_shell', 'chrome-headless-shell']) {
+          const p = path.join(cache, d, sub, bin);
+          if (fs.existsSync(p)) return p;
+        }
+      }
+    }
+  } catch (_) {}
+  for (const bin of ['chromium', 'chromium-browser', 'google-chrome', 'chrome']) {
+    try {
+      const out = require('child_process').execSync(
+        (process.platform === 'win32' ? 'where ' : 'command -v ') + bin,
+        { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split(/\r?\n/)[0];
+      if (out && fs.existsSync(out)) return out;
+    } catch (_) {}
+  }
+  return null;
+}
+const EXEC = findChrome();
+if (!EXEC) {
+  console.error('No Chromium found. Run setup first (npm install + browser download) or set CHROME_PATH.');
+  process.exit(1);
+}
 
 async function main() {
   const creds = JSON.parse(fs.readFileSync(path.join(ROOT, 'account.json'), 'utf8'));

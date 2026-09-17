@@ -13,7 +13,15 @@ Viết bằng Go (stdlib, không dependency ngoài), login qua Chromium headless
   {"account": "email@example.com", "password": "****"}
   ```
 
-## 2. Khởi động
+## 2. Khởi động (one-click)
+
+- **Linux/macOS:** chạy `./setup.sh`
+- **Windows:** double-click `setup.bat` (tự cài Node.js/Go qua winget nếu thiếu)
+
+Script tự làm: `npm install` → tải Chromium → tạo `account.json`
+(sửa email/password rồi chạy lại) → `go build` → login lấy token.
+
+Chạy thủ công (nếu không dùng setup):
 
 ```bash
 cd /home/duox/IdeaProjects/chat2api
